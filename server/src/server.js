@@ -505,99 +505,140 @@ MongoClient.connect(url, function(err, db) {
 
     //`POST /search queryText`
     app.post('/search', function(req, res) {
-      var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
-      if (typeof(req.body) === 'string') {
-        // trim() removes whitespace before and after the query.
-        // toLowerCase() makes the query lowercase.
-        var queryText = req.body.trim().toLowerCase();
-        // Get the user.
-        db.collection('users').findOne({ _id: fromUser}, function(err, userData) {
-          if (err) {
-            return sendDatabaseError(res, err);
-          } else if (userData === null) {
-            // User not found.
-            // 400: Bad request.
-            res.status(400).end();
-          }
-
-          // Get the user's feed.
-          db.collection('feeds').findOne({ _id: userData.feed }, function(err, feedData) {
-            if (err) {
-              return sendDatabaseError(res, err);
-            }
-
-            // Look for feed items within the feed that contain queryText.
-            db.collection('feedItems').find({
-              $or: feedData.contents.map((id) => { return { _id: id  }}),
-              $text: {
-                $search: queryText
-              }
-            }).toArray(function(err, items) {
-              if (err) {
-                return sendDatabaseError(res, err);
-              }
-
-              // Resolve all of the feed items.
-              var resolvedItems = [];
-              var errored = false;
-              function onResolve(err, feedItem) {
-                if (errored) {
-                  return;
-                } else if (err) {
-                  errored = true;
-                  sendDatabaseError(res, err);
-                } else {
-                  resolvedItems.push(feedItem);
-                  if (resolvedItems.length === items.length) {
-                    // Send resolved items to the client!
-                    res.send(resolvedItems);
-                  }
+        var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
+        if (typeof(req.body) === 'string') {
+            // trim() removes whitespace before and after the query.
+            // toLowerCase() makes the query lowercase.
+            var queryText = req.body.trim().toLowerCase();
+            // Get the user.
+            db.collection('users').findOne({
+                _id: fromUser
+            }, function(err, userData) {
+                if (err) {
+                    return sendDatabaseError(res, err);
+                } else if (userData === null) {
+                    // User not found.
+                    // 400: Bad request.
+                    res.status(400).end();
                 }
-              }
 
-              // Resolve all of the matched feed items in parallel.
-              for (var i = 0; i < items.length; i++) {
-                // Would be more efficient if we had a separate helper that
-                // resolved feed items from their objects and not their IDs.
-                // Not a big deal in our small applications, though.
-                getFeedItem(items[i]._id, onResolve);
-              }
+                // Get the user's feed.
+                db.collection('feeds').findOne({
+                    _id: userData.feed
+                }, function(err, feedData) {
+                    if (err) {
+                        return sendDatabaseError(res, err);
+                    }
 
-              // Special case: No results.
-              if (items.length === 0) {
-                res.send([]);
-              }
+                    // Look for feed items within the feed that contain queryText.
+                    db.collection('feedItems').find({
+                        $or: feedData.contents.map((id) => {
+                            return {
+                                _id: id
+                            }
+                        }),
+                        $text: {
+                            $search: queryText
+                        }
+                    }).toArray(function(err, items) {
+                        if (err) {
+                            return sendDatabaseError(res, err);
+                        }
+
+                        // Resolve all of the feed items.
+                        var resolvedItems = [];
+                        var errored = false;
+
+                        function onResolve(err, feedItem) {
+                            if (errored) {
+                                return;
+                            } else if (err) {
+                                errored = true;
+                                sendDatabaseError(res, err);
+                            } else {
+                                resolvedItems.push(feedItem);
+                                if (resolvedItems.length === items.length) {
+                                    // Send resolved items to the client!
+                                    res.send(resolvedItems);
+                                }
+                            }
+                        }
+
+                        // Resolve all of the matched feed items in parallel.
+                        for (var i = 0; i < items.length; i++) {
+                            // Would be more efficient if we had a separate helper that
+                            // resolved feed items from their objects and not their IDs.
+                            // Not a big deal in our small applications, though.
+                            getFeedItem(items[i]._id, onResolve);
+                        }
+
+                        // Special case: No results.
+                        if (items.length === 0) {
+                            res.send([]);
+                        }
+                    });
+                });
             });
-          });
-        });
-      } else {
-        // 400: Bad Request.
-        res.status(400).end();
-      }
+        } else {
+            // 400: Bad Request.
+            res.status(400).end();
+        }
     });
+
+
+    function postComment(userId, feedItemId, content, time, callback) {
+        // The new comment
+        var newComment = {
+            "likeCounter": [],
+            "author": userId,
+            "postDate": time,
+            "contents": content
+        };
+
+        // Add the comment to the database.
+        db.collection('feedItems').updateOne({
+                _id: feedItemId
+            }, {
+                $push: {
+                    comments: newComment
+                }
+            },
+            function(err) {
+                if (err) {
+                    return callback(err);
+                }
+                // Return the updated feed item to the application.
+                getFeedItem(feedItemId, function(err, feedItem) {
+                    if (err) {
+                        return callback(err);
+                    }
+                    callback(null, feedItem);
+                });
+            });
+    }
 
     // Post a comment
     app.post('/feeditem/:feeditemid/comments', validate({
         body: CommentSchema
     }), function(req, res) {
+        var body = req.body;
         var fromUser = getUserIdFromToken(req.get('Authorization'));
-        var comment = req.body;
-        var author = req.body.author;
         var feedItemId = req.params.feeditemid;
-        if (fromUser === author) {
-            var feedItem = readDocument('feedItems', feedItemId);
-            // Initialize likeCounter to empty.
-            comment.likeCounter = [];
-            // Push returns the new length of the array.
-            // The index of the new element is the length of the array minus 1.
-            // Example: [].push(1) returns 1, but the index of the new element is 0.
-            var index = feedItem.comments.push(comment) - 1;
-            writeDocument('feedItems', feedItem);
-            // 201: Created.
-            res.status(201);
-            res.set('Location', '/feeditem/' + feedItemId + "/comments/" + index);
-            // Return a resolved version of the feed item.
-            res.send(getFeedItemSync(feedItemId));
+        if (fromUser === body.author) {
+            postComment(new ObjectID(fromUser), new ObjectID(feedItemId), body.contents, body.postDate, function(err, updatedFeedItem) {
+                if (err) {
+                    // A database error happened.
+                    // 500: Internal error.
+                    res.status(500).send("A database error occurred: " + err);
+                } else {
+                    // When POST creates a new resource, we should tell the client about it
+                    // in the 'Location' header and use status code 201.
+                    res.status(201);
+                    res.set('Location', '/feeditem/' + updatedFeedItem._id);
+                    // Send the update!
+                    res.send(updatedFeedItem);
+                }
+            });
         } else {
             // Unauthorized.
             res.status(401).end();
@@ -606,21 +647,42 @@ MongoClient.connect(url, function(err, db) {
 
     app.put('/feeditem/:feeditemid/comments/:commentindex/likelist/:userid', function(req, res) {
         var fromUser = getUserIdFromToken(req.get('Authorization'));
-        var userId = parseInt(req.params.userid, 10);
-        var feedItemId = parseInt(req.params.feeditemid, 10);
+        var feedItemId = new ObjectID(req.params.feeditemid);
+        var userId = req.params.userid;
         var commentIdx = parseInt(req.params.commentindex, 10);
         // Only a user can mess with their own like.
         if (fromUser === userId) {
-            var feedItem = readDocument('feedItems', feedItemId);
-            var comment = feedItem.comments[commentIdx];
-            // Only change the likeCounter if the user isn't in it.
-            if (comment.likeCounter.indexOf(userId) === -1) {
-                comment.likeCounter.push(userId);
-            }
-            writeDocument('feedItems', feedItem);
-            comment.author = readDocument('users', comment.author);
-            // Send back the updated comment.
-            res.send(comment);
+            // First, we can update the like counter.
+            db.collection('feedItems').updateOne({
+                _id: feedItemId
+            }, {
+                // Add `userId` to the likeCounter if it is not already
+                // in the array.
+                $addToSet: {
+                    ['comments.' + commentIdx + '.likeCounter']: new ObjectID(userId)
+                }
+            }, function(err) {
+                if (err) {
+                    return sendDatabaseError(res, err);
+                }
+                // Second, grab the feed item now that we have updated it.
+                db.collection('feedItems').findOne({
+                    _id: feedItemId
+                }, function(err, feedItem) {
+                    if (err) {
+                        return sendDatabaseError(res, err);
+                    }
+                    // Return a resolved version of the comment
+                    resolveUserObjects([feedItem.comments[commentIdx].author], function(err, userMap) {
+                        if (err) {
+                            return sendDatabaseError(res, err);
+                        }
+                        // Return a resolved version of the comment
+                        feedItem.comments[commentIdx].author = userMap[feedItem.comments[commentIdx].author];
+                        res.send(feedItem.comments[commentIdx]);
+                    });
+                });
+            });
         } else {
             // Unauthorized.
             res.status(401).end();
@@ -629,20 +691,42 @@ MongoClient.connect(url, function(err, db) {
 
     app.delete('/feeditem/:feeditemid/comments/:commentindex/likelist/:userid', function(req, res) {
         var fromUser = getUserIdFromToken(req.get('Authorization'));
-        var userId = parseInt(req.params.userid, 10);
-        var feedItemId = parseInt(req.params.feeditemid, 10);
+        var feedItemId = new ObjectID(req.params.feeditemid);
+        var userId = req.params.userid;
         var commentIdx = parseInt(req.params.commentindex, 10);
         // Only a user can mess with their own like.
         if (fromUser === userId) {
-            var feedItem = readDocument('feedItems', feedItemId);
-            var comment = feedItem.comments[commentIdx];
-            var userIndex = comment.likeCounter.indexOf(userId);
-            if (userIndex !== -1) {
-                comment.likeCounter.splice(userIndex, 1);
-                writeDocument('feedItems', feedItem);
-            }
-            comment.author = readDocument('users', comment.author);
-            res.send(comment);
+            // First, we can update the like counter.
+            db.collection('feedItems').updateOne({
+                _id: feedItemId
+            }, {
+                // Add `userId` to the likeCounter if it is not already
+                // in the array.
+                $pull: {
+                    ['comments.' + commentIdx + '.likeCounter']: new ObjectID(userId)
+                }
+            }, function(err) {
+                if (err) {
+                    return sendDatabaseError(res, err);
+                }
+                // Second, grab the feed item now that we have updated it.
+                db.collection('feedItems').findOne({
+                    _id: feedItemId
+                }, function(err, feedItem) {
+                    if (err) {
+                        return sendDatabaseError(res, err);
+                    }
+                    // Return a resolved version of the comment
+                    resolveUserObjects([feedItem.comments[commentIdx].author], function(err, userMap) {
+                        if (err) {
+                            return sendDatabaseError(res, err);
+                        }
+                        // Return a resolved version of the comment
+                        feedItem.comments[commentIdx].author = userMap[feedItem.comments[commentIdx].author];
+                        res.send(feedItem.comments[commentIdx]);
+                    });
+                });
+            });
         } else {
             // Unauthorized.
             res.status(401).end();
@@ -651,10 +735,10 @@ MongoClient.connect(url, function(err, db) {
 
     // Reset the database.
     app.post('/resetdb', function(req, res) {
-      console.log("Resetting database...");
-      ResetDatabase(db, function() {
-        res.send();
-      });
+        console.log("Resetting database...");
+        ResetDatabase(db, function() {
+            res.send();
+        });
     });
 
     /**
